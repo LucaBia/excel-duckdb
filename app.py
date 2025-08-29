@@ -9,6 +9,14 @@ from src.db import (
     get_table_columns,
     count_failed_casts,
     change_column_type,
+    list_ingest_batches,
+    undo_ingest_batch,
+    undo_update_batch,
+    list_schema_events,
+    schema_add_column,
+    schema_rename_column,
+    schema_drop_column,
+    revert_schema_event,
     save_view,
     list_views,
     load_view_spec,
@@ -17,10 +25,33 @@ from src.db import (
     save_dashboard,
     list_dashboards,
     load_dashboard_charts,
+    ensure_audit_column,
+    start_ingest_batch,
+    finalize_ingest_batch,
+    finalize_ingest_batch_meta,
+    log_update_versions,
+    update_rows_from_df,
+    insert_rows_from_df,
+    delete_rows_by_keys,
 )
 from src.ingest import load_excel_to_df, smart_casts, upsert_df
 
 st.set_page_config(page_title="Excel → DuckDB (Local)", layout="wide")
+
+
+def _sanitize_for_duckdb(df: pd.DataFrame) -> pd.DataFrame:
+    """Reemplaza NaN/NaT/pd.NA por None y ajusta dtypes para registrar en DuckDB."""
+    try:
+        out = df.copy()
+        for c in out.columns:
+            out[c] = out[c].where(pd.notna(out[c]), None)
+            # Evitar pandas nullable Int64 con None → usa object
+            dtype_name = str(out[c].dtype)
+            if dtype_name.lower() in ("int64", "int32", "int16", "int8", "uint64", "uint32", "uint16", "uint8", "Int64"):
+                out[c] = out[c].astype(object)
+        return out
+    except Exception:
+        return df
 
 # --- Sidebar: Instancia ---
 st.sidebar.header("Instancia (archivo .duckdb)")
@@ -38,7 +69,7 @@ st.title("Excel → DuckDB (local)")
 st.caption("100% local, sin servidor. Carga, normaliza, inserta, filtra y explora.")
 
 # --- Sección: Ingesta ---
-with st.expander("📥 Subir Excel e ingestar", expanded=True):
+with st.expander("📥 Subir Excel e ingestar", expanded=False):
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         file = st.file_uploader("Archivo Excel", type=["xlsx", "xls"], accept_multiple_files=False)
@@ -72,7 +103,7 @@ with st.expander("📥 Subir Excel e ingestar", expanded=True):
                 st.error(f"Error de ingesta: {e}")
 
 # --- Sección: Exploración ---
-with st.expander("🔎 Explorar con SQL", expanded=True):
+with st.expander("🔎 Explorar con SQL", expanded=False):
     default_sql = f"SELECT * FROM {quote_ident(table_name)} LIMIT 100;"
     sql = st.text_area("Consulta SQL", value=default_sql, height=140)
     if st.button("Ejecutar consulta"):
@@ -84,7 +115,9 @@ with st.expander("🔎 Explorar con SQL", expanded=True):
             st.error(str(e))
 
 # --- Sección: Visualizador de tablas ---
-with st.expander("🗂️ Visualizador de tablas (todas las filas)", expanded=True):
+with st.expander("🗂️ Visualizador de tablas (todas las filas)", expanded=False):
+    if st.button("Actualizar", key="refresh_browse"):
+        st.rerun()
     try:
         tables_df = conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name;"
@@ -114,8 +147,250 @@ with st.expander("🗂️ Visualizador de tablas (todas las filas)", expanded=Tr
         ).df()
         st.dataframe(df_browse, width='stretch', height=400)
 
+# --- Sección: Editor de datos ---
+with st.expander("✏️ Editar datos (inline)", expanded=False):
+    if st.button("Actualizar", key="refresh_edit"):
+        st.rerun()
+    # Elegir tabla y claves
+    try:
+        tables_df_ed = conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name;"
+        ).df()
+        table_opts_ed = tables_df_ed["table_name"].tolist()
+    except Exception:
+        table_opts_ed = []
+    if not table_opts_ed:
+        st.info("No hay tablas para editar.")
+    else:
+        t_edit = st.selectbox("Tabla a editar", options=table_opts_ed, key="edit_table")
+        cols_meta_ed = get_table_columns(conn, t_edit)
+        col_names_ed = [c["name"] for c in cols_meta_ed]
+        # Sugerir clave por defecto
+        default_keys = [c for c in col_names_ed if c.lower() == "id"] or []
+        keys = st.multiselect("Columnas clave (para identificar filas)", options=col_names_ed, default=default_keys, help="Se usan para detectar filas nuevas/actualizadas/eliminadas.")
+        if not keys:
+            st.warning("Selecciona al menos una columna clave.")
+        # Paginación
+        total_rows_e = conn.execute(f"SELECT COUNT(*) FROM {quote_ident(t_edit)};").fetchone()[0]
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            page_size_e = st.number_input("Filas por página", 20, 1000, 50, step=10, key="edit_ps")
+        with c2:
+            max_page_e = max(1, (total_rows_e + page_size_e - 1) // page_size_e)
+            page_e = st.number_input("Página", 1, int(max_page_e), 1, key="edit_pg")
+        with c3:
+            st.metric("Total filas", total_rows_e)
+        offset_e = (int(page_e) - 1) * int(page_size_e)
+        df_orig = conn.execute(
+            f"SELECT * FROM {quote_ident(t_edit)} LIMIT ? OFFSET ?;",
+            [int(page_size_e), int(offset_e)],
+        ).df()
+        # Excluir columnas protegidas del editor
+        protected_cols = ["_ingest_batch_id"]
+        df_view = df_orig.drop(columns=protected_cols, errors='ignore')
+        allow_add = st.checkbox("Permitir añadir filas nuevas", value=False)
+        allow_delete = st.checkbox("Permitir eliminar filas en esta página", value=False, help="No hay undo para borrados desde el editor (aún).")
+        edited = st.data_editor(df_view, num_rows=("dynamic" if allow_add else "fixed"), key="editor_df")
+        if st.button("Guardar cambios", type="primary"):
+            try:
+                import pandas as _pd
+                if not keys:
+                    st.error("Debes seleccionar al menos una clave.")
+                else:
+                    # Limitar a filas con claves no nulas
+                    edited_valid = edited.dropna(subset=keys) if not edited.empty else edited
+                    orig_valid = df_view.dropna(subset=keys) if not df_view.empty else df_view
+                    # Sanitizar para DuckDB (None en vez de NaN)
+                    edited_valid = _sanitize_for_duckdb(edited_valid)
+                    orig_valid = _sanitize_for_duckdb(orig_valid)
+                    # Índices por claves
+                    idx_orig = orig_valid.set_index(keys, drop=False)
+                    idx_edit = edited_valid.set_index(keys, drop=False)
+                    # Nuevas y borradas
+                    new_keys = idx_edit.index.difference(idx_orig.index)
+                    del_keys = idx_orig.index.difference(idx_edit.index)
+                    new_rows = idx_edit.loc[new_keys].reset_index(drop=True) if len(new_keys) else _pd.DataFrame(columns=edited_valid.columns)
+                    del_rows = idx_orig.loc[del_keys][keys].reset_index(drop=True) if (allow_delete and len(del_keys)) else _pd.DataFrame(columns=keys)
+                    # Detectar cambios en las comunes
+                    common_keys = idx_edit.index.intersection(idx_orig.index)
+                    upd_rows = _pd.DataFrame(columns=edited_valid.columns)
+                    updated_cols = []
+                    if len(common_keys):
+                        left = idx_orig.loc[common_keys]
+                        right = idx_edit.loc[common_keys]
+                        non_key_cols = [c for c in col_names_ed if c not in keys and c not in protected_cols]
+                        if non_key_cols:
+                            # Comparar valores, tratando NaN como iguales
+                            comp = (left[non_key_cols].fillna("__NaN__") != right[non_key_cols].fillna("__NaN__"))
+                            diff_mask = comp.any(axis=1)
+                            if diff_mask.any():
+                                # Columnas cambiadas: union de difs por columna
+                                changed_cols = [c for c in non_key_cols if comp[c].any()]
+                                updated_cols = changed_cols
+                                cols_for_update = keys + updated_cols
+                                upd_rows = right.loc[diff_mask, cols_for_update].reset_index(drop=True)
+                                upd_rows = _sanitize_for_duckdb(upd_rows)
+                    # Preparar auditoría
+                    ensure_audit_column(conn, t_edit)
+                    batch_id = start_ingest_batch(conn, t_edit)
+                    inserted_count = 0
+                    updated_count = 0
+                    # Log versiones de updates antes de aplicar
+                    if not (upd_rows is None or upd_rows.empty):
+                        # Construir filas previas con valores antiguos
+                        pre_rows = []
+                        l_prev = left.loc[diff_mask] if 'diff_mask' in locals() else _pd.DataFrame(columns=col_names_ed)
+                        for _, r in l_prev.iterrows():
+                            prev = {k: r[k] for k in keys}
+                            for c in updated_cols:
+                                prev[c] = r[c]
+                            pre_rows.append(prev)
+                        if pre_rows:
+                            finalize_ingest_batch_meta(conn, batch_id, t_edit, keys, updated_cols)
+                            log_update_versions(conn, t_edit, batch_id, pre_rows, keys, updated_cols)
+                        updated_count = update_rows_from_df(conn, t_edit, upd_rows, keys, cols_to_update=updated_cols)
+                    # Inserts
+                    if not (new_rows is None or new_rows.empty):
+                        new_rows = _sanitize_for_duckdb(new_rows)
+                        inserted_count = insert_rows_from_df(conn, t_edit, new_rows, batch_id)
+                    # Deletes
+                    if allow_delete and not del_rows.empty:
+                        delete_rows_by_keys(conn, t_edit, del_rows, keys)
+                    finalize_ingest_batch(conn, batch_id, t_edit, inserted=inserted_count, updated=updated_count)
+                    st.success(f"Cambios guardados. Insertados: {inserted_count}, Actualizados: {updated_count}. Para deshacer inserts/updates, usa Auditoría → Lotes.")
+            except Exception as e:
+                st.error(f"No se pudo guardar: {e}")
+
+# --- Sección: Exportar ---
+with st.expander("📤 Exportar datos", expanded=False):
+    if st.button("Actualizar", key="refresh_export"):
+        st.rerun()
+    src = st.radio("Fuente", ["Tabla", "Último resultado"], horizontal=True)
+    if src == "Último resultado" and "last_query_df" in st.session_state:
+        exp_df = st.session_state["last_query_df"]
+        st.caption(f"Filas: {len(exp_df)}")
+        fmt = st.selectbox("Formato", ["CSV", "Excel", "Parquet"], index=0)
+        fn = st.text_input("Nombre de archivo", value="export")
+        if st.button("Generar archivo"):
+            import io
+            data = None
+            mime = "text/csv"
+            filename = fn
+            try:
+                if fmt == "CSV":
+                    buf = io.StringIO()
+                    exp_df.to_csv(buf, index=False)
+                    data = buf.getvalue().encode("utf-8")
+                    filename += ".csv"
+                elif fmt == "Excel":
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                        exp_df.to_excel(writer, index=False)
+                    data = buf.getvalue()
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    filename += ".xlsx"
+                else:
+                    try:
+                        import pyarrow  # noqa: F401
+                        buf = io.BytesIO()
+                        exp_df.to_parquet(buf, index=False)
+                        data = buf.getvalue()
+                        mime = "application/octet-stream"
+                        filename += ".parquet"
+                    except Exception:
+                        st.warning("Parquet no disponible, exportando a CSV")
+                        buf = io.StringIO()
+                        exp_df.to_csv(buf, index=False)
+                        data = buf.getvalue().encode("utf-8")
+                        filename += ".csv"
+            except Exception as e:
+                st.error(f"Error exportando: {e}")
+                data = None
+            if data is not None:
+                st.download_button("Descargar", data=data, file_name=filename, mime=mime)
+    else:
+        # Exportar tabla completa
+        try:
+            tables_df = conn.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name;"
+            ).df()
+            table_options = tables_df["table_name"].tolist()
+        except Exception:
+            table_options = []
+        if not table_options:
+            st.info("No hay tablas para exportar.")
+        else:
+            texp = st.selectbox("Tabla", options=table_options)
+            fmt = st.selectbox("Formato", ["CSV", "Excel", "Parquet", "CSV (ZIP, por chunks)"], index=0, key="fmt_tab")
+            fn = st.text_input("Nombre de archivo", value=f"{texp}", key="fn_tab")
+            if fmt == "CSV (ZIP, por chunks)":
+                chunk_size = st.number_input("Tamaño de chunk", min_value=10000, max_value=1000000, value=100000, step=10000, key="chunk_sz")
+            if st.button("Generar archivo de tabla"):
+                import io
+                try:
+                    data = None
+                    mime = "text/csv"
+                    filename = fn
+                    if fmt == "CSV":
+                        df_all = conn.execute(f"SELECT * FROM {quote_ident(texp)};").df()
+                        buf = io.StringIO()
+                        df_all.to_csv(buf, index=False)
+                        data = buf.getvalue().encode("utf-8")
+                        filename += ".csv"
+                    elif fmt == "Excel":
+                        df_all = conn.execute(f"SELECT * FROM {quote_ident(texp)};").df()
+                        buf = io.BytesIO()
+                        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                            df_all.to_excel(writer, index=False)
+                        data = buf.getvalue()
+                        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        filename += ".xlsx"
+                    elif fmt == "Parquet":
+                        try:
+                            import pyarrow  # noqa: F401
+                            df_all = conn.execute(f"SELECT * FROM {quote_ident(texp)};").df()
+                            buf = io.BytesIO()
+                            df_all.to_parquet(buf, index=False)
+                            data = buf.getvalue()
+                            mime = "application/octet-stream"
+                            filename += ".parquet"
+                        except Exception:
+                            st.warning("Parquet no disponible, exportando a CSV")
+                            df_all = conn.execute(f"SELECT * FROM {quote_ident(texp)};").df()
+                            buf = io.StringIO()
+                            df_all.to_csv(buf, index=False)
+                            data = buf.getvalue().encode("utf-8")
+                            filename += ".csv"
+                    else:  # CSV (ZIP, por chunks)
+                        import zipfile
+                        zip_buf = io.BytesIO()
+                        with zipfile.ZipFile(zip_buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                            csv_buf = io.StringIO()
+                            # Cabecera + chunks
+                            offset = 0
+                            wrote_header = False
+                            while True:
+                                chunk_df = conn.execute(
+                                    f"SELECT * FROM {quote_ident(texp)} LIMIT ? OFFSET ?;",
+                                    [int(chunk_size), int(offset)],
+                                ).df()
+                                if chunk_df.empty:
+                                    break
+                                chunk_df.to_csv(csv_buf, index=False, header=(not wrote_header))
+                                wrote_header = True
+                                offset += int(chunk_size)
+                            zf.writestr(f"{texp}.csv", csv_buf.getvalue().encode('utf-8'))
+                        data = zip_buf.getvalue()
+                        mime = "application/zip"
+                        filename += ".zip"
+                    st.download_button("Descargar tabla", data=data, file_name=filename, mime=mime)
+                except Exception as e:
+                    st.error(f"Error exportando: {e}")
+
 # --- Sección: Esquema (cambiar tipos de columnas) ---
 with st.expander("🧩 Esquema: cambiar tipo de columna", expanded=False):
+    if st.button("Actualizar", key="refresh_schema"):
+        st.rerun()
     try:
         tables_df3 = conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name;"
@@ -176,8 +451,40 @@ with st.expander("🧩 Esquema: cambiar tipo de columna", expanded=False):
                 except Exception as e:
                     st.error(f"No se pudo cambiar el tipo: {e}")
 
+        st.divider()
+        st.subheader("Otras operaciones de esquema")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            new_col = st.text_input("Añadir columna: nombre", key="add_col_name")
+            new_type2 = st.selectbox("Tipo", ["VARCHAR","INTEGER","BIGINT","DOUBLE","DATE","TIMESTAMP","BOOLEAN","DECIMAL(18,2)"], key="add_col_type")
+            if st.button("Añadir columna"):
+                try:
+                    schema_add_column(conn, t3, new_col, new_type2)
+                    st.success(f"Columna {new_col} añadida")
+                except Exception as e:
+                    st.error(f"No se pudo añadir: {e}")
+        with c2:
+            oldn = st.text_input("Renombrar: nombre actual", key="ren_old")
+            newn = st.text_input("Renombrar: nombre nuevo", key="ren_new")
+            if st.button("Renombrar columna"):
+                try:
+                    schema_rename_column(conn, t3, oldn, newn)
+                    st.success(f"Renombrada {oldn} → {newn}")
+                except Exception as e:
+                    st.error(f"No se pudo renombrar: {e}")
+        with c3:
+            delc = st.text_input("Eliminar columna: nombre", key="drop_col")
+            if st.button("Eliminar columna"):
+                try:
+                    schema_drop_column(conn, t3, delc)
+                    st.success(f"Eliminada columna {delc}")
+                except Exception as e:
+                    st.error(f"No se pudo eliminar: {e}")
+
 # --- Sección: Builder de filtros (sin SQL) + Vistas guardadas ---
-with st.expander("🧰 Builder de filtros (sin SQL) y Vistas", expanded=True):
+with st.expander("🧰 Builder de filtros (sin SQL) y Vistas", expanded=False):
+    if st.button("Actualizar", key="refresh_filters"):
+        st.rerun()
     # Elegir tabla base
     try:
         tables_df2 = conn.execute(
@@ -320,7 +627,9 @@ with st.expander("🧰 Builder de filtros (sin SQL) y Vistas", expanded=True):
             st.error(f"No se pudieron listar vistas: {e}")
 
 # --- Sección: Gráficas y Dashboards ---
-with st.expander("📊 Gráficas y Dashboards", expanded=True):
+with st.expander("📊 Gráficas y Dashboards", expanded=False):
+    if st.button("Actualizar", key="refresh_dash"):
+        st.rerun()
     # Fuente: usar resultado filtrado si existe, si no, tabla destino
     src_choice = st.radio("Fuente de datos", ["Tabla destino", "Último filtrado/consulta"], horizontal=True)
     if src_choice == "Último filtrado/consulta" and "last_query_df" in st.session_state:
@@ -445,3 +754,55 @@ with st.expander("📊 Gráficas y Dashboards", expanded=True):
                             st.plotly_chart(fig, width='stretch', key=f"dash_chart_{c['id']}_{i}")
                 except Exception as e:
                     st.error(f"Error al renderizar dashboard: {e}")
+
+# --- Sección: Auditoría ---
+with st.expander("🧾 Auditoría (ingesta y esquema)", expanded=False):
+    # Ingesta: listar lotes y deshacer
+    try:
+        tables_df4 = conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name;"
+        ).df()
+        table_options4 = tables_df4["table_name"].tolist()
+    except Exception:
+        table_options4 = []
+    if not table_options4:
+        st.info("No hay tablas para auditar.")
+    else:
+        t4 = st.selectbox("Tabla", options=table_options4, key="audit_table")
+        st.subheader("Lotes de ingesta")
+        try:
+            batches = list_ingest_batches(conn, t4)
+            if batches.empty:
+                st.info("Sin lotes registrados.")
+            else:
+                st.dataframe(batches, width='stretch', height=240)
+                bid = st.number_input("ID de lote", min_value=1, step=1, key="undo_bid")
+                c_undo_i, c_undo_u = st.columns(2)
+                with c_undo_i:
+                    if st.button("Deshacer INSERTs"):
+                        try:
+                            deleted = undo_ingest_batch(conn, t4, int(bid))
+                            st.success(f"Eliminadas {deleted} filas del lote #{int(bid)}")
+                        except Exception as e:
+                            st.error(f"No se pudo deshacer: {e}")
+                with c_undo_u:
+                    if st.button("Deshacer UPDATEs"):
+                        try:
+                            from src.db import undo_update_batch
+                            restored = undo_update_batch(conn, t4, int(bid))
+                            st.success(f"Revertidas {restored} filas actualizadas del lote #{int(bid)}")
+                        except Exception as e:
+                            st.error(f"No se pudo revertir updates: {e}")
+        except Exception as e:
+            st.error(f"Error listando lotes: {e}")
+
+        st.subheader("Cambios de esquema")
+        try:
+            se = list_schema_events(conn, t4)
+            if se.empty:
+                st.info("Sin eventos de esquema.")
+            else:
+                st.dataframe(se, width='stretch', height=200)
+                st.caption("Para revertir cambios de tipo, usa el panel de Esquema seleccionando el tipo anterior.")
+        except Exception as e:
+            st.error(f"Error listando eventos de esquema: {e}")

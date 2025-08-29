@@ -3,7 +3,19 @@ from __future__ import annotations
 import pandas as pd
 import duckdb
 from typing import Optional, Tuple, Dict
-from .db import ensure_table, add_unique_index, quote_ident
+from .db import (
+    ensure_table,
+    add_unique_index,
+    quote_ident,
+    ensure_audit_column,
+    start_ingest_batch,
+    finalize_ingest_batch,
+    finalize_ingest_batch_meta,
+    log_update_versions,
+)
+
+def _quote(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 def load_excel_to_df(file, start_row: int, sheet_name: Optional[str]) -> pd.DataFrame:
     """
@@ -70,8 +82,10 @@ def upsert_df(
     if df.empty:
         return 0, {"inserted": 0, "updated": 0}
 
-    # Asegurar tabla
+    # Asegurar tabla y columna de auditoría
     ensure_table(conn, table, df)
+    ensure_audit_column(conn, table)
+    batch_id = start_ingest_batch(conn, table)
 
     # Registrar DataFrame como vista temporal
     conn.register("df_tmp_streamlit", df)
@@ -83,11 +97,24 @@ def upsert_df(
     cols = list(df.columns)
     cols_quoted = ", ".join(quote_ident(c) for c in cols)
 
+    inserted_count = 0
+    updated_count = 0
+
     if unique_keys:
         # UPSERT en 2 pasos (compatible con DuckDB sin MERGE):
         # 1) UPDATE filas existentes con join por claves
         non_key_cols = [c for c in cols if c not in unique_keys]
         if non_key_cols:
+            # Registrar versiones previas antes de actualizar
+            key_select = ", ".join([f"t.{quote_ident(k)} AS {quote_ident(k)}" for k in unique_keys])
+            old_select = ", ".join([f"t.{quote_ident(c)} AS {quote_ident(c)}" for c in non_key_cols])
+            join_on = " AND ".join([f"t.{quote_ident(k)} = s.{quote_ident(k)}" for k in unique_keys])
+            pre = conn.execute(
+                f"SELECT {key_select}{(', ' + old_select) if old_select else ''} FROM {quote_ident(table)} AS t JOIN df_tmp_streamlit AS s ON {join_on};"
+            ).df()
+            if not pre.empty:
+                finalize_ingest_batch_meta(conn, batch_id, table, unique_keys, non_key_cols)
+                log_update_versions(conn, table, batch_id, pre.to_dict(orient="records"), unique_keys, non_key_cols)
             set_clause = ", ".join([f"{quote_ident(c)} = s.{quote_ident(c)}" for c in non_key_cols])
             on_clause = " AND ".join([f"t.{quote_ident(k)} = s.{quote_ident(k)}" for k in unique_keys])
             update_sql = f"""
@@ -97,18 +124,35 @@ def upsert_df(
                 WHERE {on_clause};
             """
             conn.execute(update_sql)
+            # No cambiamos batch_id para updates; contamos luego
         # 2) INSERT filas nuevas (las que no existen por claves)
         on_exists_clause = " AND ".join([f"t.{quote_ident(k)} = s.{quote_ident(k)}" for k in unique_keys])
         insert_sql = f"""
-            INSERT INTO {quote_ident(table)} ({cols_quoted})
-            SELECT {cols_quoted}
+            INSERT INTO {quote_ident(table)} ({cols_quoted}, {_quote('_ingest_batch_id')})
+            SELECT {cols_quoted}, ?
             FROM df_tmp_streamlit AS s
             WHERE NOT EXISTS (
                 SELECT 1 FROM {quote_ident(table)} AS t WHERE {on_exists_clause}
             );
         """
-        conn.execute(insert_sql)
-        return len(df), {"updated_or_inserted": len(df)}
+        conn.execute(insert_sql, [int(batch_id)])
+        # Contar insertados de este lote
+        inserted_count = conn.execute(
+            f"SELECT COUNT(*) FROM {quote_ident(table)} WHERE {_quote('_ingest_batch_id')} = ?;",
+            [int(batch_id)],
+        ).fetchone()[0]
+        # Estimar actualizados como los del DF que no fueron insertados
+        updated_count = max(0, len(df) - int(inserted_count))
+        finalize_ingest_batch(conn, batch_id, table, inserted=inserted_count, updated=updated_count)
+        return len(df), {"inserted": int(inserted_count), "updated": int(updated_count)}
     else:
-        conn.execute(f'INSERT INTO {quote_ident(table)} ({cols_quoted}) SELECT {cols_quoted} FROM df_tmp_streamlit;')
-        return len(df), {"inserted": len(df)}
+        conn.execute(
+            f'INSERT INTO {quote_ident(table)} ({cols_quoted}, {_quote("_ingest_batch_id")}) SELECT {cols_quoted}, ? FROM df_tmp_streamlit;',
+            [int(batch_id)],
+        )
+        inserted_count = conn.execute(
+            f"SELECT COUNT(*) FROM {quote_ident(table)} WHERE {_quote('_ingest_batch_id')} = ?;",
+            [int(batch_id)],
+        ).fetchone()[0]
+        finalize_ingest_batch(conn, batch_id, table, inserted=int(inserted_count), updated=0)
+        return len(df), {"inserted": int(inserted_count)}
