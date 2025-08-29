@@ -129,7 +129,7 @@ with st.expander("🗂️ Visualizador de tablas (todas las filas)", expanded=Fa
     if not table_options:
         st.info("No hay tablas todavía. Ingresa datos en la sección de arriba.")
     else:
-        sel_table = st.selectbox("Tabla", options=table_options, index=(table_options.index(table_name) if table_name in table_options else 0))
+        sel_table = st.selectbox("Tabla", options=table_options, index=(table_options.index(table_name) if table_name in table_options else 0), key="browse_table")
         # Paginación simple
         total_rows = conn.execute(f"SELECT COUNT(*) FROM {quote_ident(sel_table)};").fetchone()[0]
         c1, c2, c3 = st.columns(3)
@@ -269,7 +269,7 @@ with st.expander("📤 Exportar datos", expanded=False):
     if src == "Último resultado" and "last_query_df" in st.session_state:
         exp_df = st.session_state["last_query_df"]
         st.caption(f"Filas: {len(exp_df)}")
-        fmt = st.selectbox("Formato", ["CSV", "Excel", "Parquet"], index=0)
+        fmt = st.selectbox("Formato", ["CSV", "Excel", "Parquet"], index=0, key="fmt_result")
         fn = st.text_input("Nombre de archivo", value="export")
         if st.button("Generar archivo"):
             import io
@@ -320,7 +320,7 @@ with st.expander("📤 Exportar datos", expanded=False):
         if not table_options:
             st.info("No hay tablas para exportar.")
         else:
-            texp = st.selectbox("Tabla", options=table_options)
+            texp = st.selectbox("Tabla", options=table_options, key="export_table")
             fmt = st.selectbox("Formato", ["CSV", "Excel", "Parquet", "CSV (ZIP, por chunks)"], index=0, key="fmt_tab")
             fn = st.text_input("Nombre de archivo", value=f"{texp}", key="fn_tab")
             if fmt == "CSV (ZIP, por chunks)":
@@ -646,12 +646,12 @@ with st.expander("📊 Gráficas y Dashboards", expanded=False):
         cols = list(data_df.columns)
         c1, c2, c3 = st.columns(3)
         with c1:
-            mark = st.selectbox("Tipo", ["line", "bar", "scatter"], index=0)
+            mark = st.selectbox("Tipo", ["line", "bar", "scatter"], index=0, key="chart_mark")
         with c2:
-            col_x = st.selectbox("Eje X", cols, index=0)
+            col_x = st.selectbox("Eje X", cols, index=0, key="chart_x")
         with c3:
-            col_y = st.selectbox("Métrica Y", cols, index=min(1, len(cols)-1))
-        agg = st.selectbox("Agregación", ["sum", "avg", "count", "min", "max"], index=0)
+            col_y = st.selectbox("Métrica Y", cols, index=min(1, len(cols)-1), key="chart_y")
+        agg = st.selectbox("Agregación", ["sum", "avg", "count", "min", "max"], index=0, key="chart_agg")
 
         try:
             q = f"""
@@ -725,6 +725,7 @@ with st.expander("📊 Gráficas y Dashboards", expanded=False):
                 "Dashboard",
                 options=ddf["id"].tolist(),
                 format_func=lambda did: f"#{did} – " + ddf.set_index("id").loc[did, "dashboard_name"],
+                key="dash_select",
             )
             if st.button("Renderizar dashboard"):
                 try:
