@@ -7,6 +7,7 @@ from .db import (
     ensure_table,
     add_unique_index,
     quote_ident,
+    ensure_columns_exist,
     get_table_columns,
     ensure_audit_column,
     start_ingest_batch,
@@ -88,6 +89,12 @@ def upsert_df(
     ensure_audit_column(conn, table)
     batch_id = start_ingest_batch(conn, table)
 
+    # Asegurar columnas nuevas en la tabla (las del DF que no existan aún)
+    try:
+        ensure_columns_exist(conn, table, df)
+    except Exception:
+        pass
+
     # Registrar DataFrame como vista temporal
     conn.register("df_tmp_streamlit", df)
 
@@ -95,30 +102,23 @@ def upsert_df(
     unique_keys = unique_keys or []
     add_unique_index(conn, table, unique_keys)
 
-    # Columnas del DataFrame y de la tabla
-    df_cols = list(df.columns)
-    try:
-        tbl_cols_meta = get_table_columns(conn, table)
-        table_cols = [c["name"] for c in tbl_cols_meta]
-    except Exception:
-        table_cols = df_cols[:]  # fallback
-    # Intersección: usar solo columnas presentes en la tabla
-    common_cols = [c for c in df_cols if c in table_cols]
-    if not common_cols:
+    # Columnas a usar: todas las del DataFrame (la tabla ya fue alterada para soportarlas)
+    cols = list(df.columns)
+    if not cols:
         return 0, {"inserted": 0, "updated": 0}
-    cols_quoted = ", ".join(quote_ident(c) for c in common_cols)
+    cols_quoted = ", ".join(quote_ident(c) for c in cols)
 
     inserted_count = 0
     updated_count = 0
 
     if unique_keys:
         # Validar que las claves existan en el DF/tabla
-        missing_keys = [k for k in unique_keys if k not in common_cols]
+        missing_keys = [k for k in unique_keys if k not in cols]
         if missing_keys:
             raise ValueError(f"Las claves seleccionadas no están en los datos: {missing_keys}")
         # UPSERT en 2 pasos (compatible con DuckDB sin MERGE):
         # 1) UPDATE filas existentes con join por claves
-        non_key_cols = [c for c in common_cols if c not in unique_keys]
+        non_key_cols = [c for c in cols if c not in unique_keys]
         if non_key_cols:
             # Registrar versiones previas antes de actualizar
             key_select = ", ".join([f"t.{quote_ident(k)} AS {quote_ident(k)}" for k in unique_keys])

@@ -4,7 +4,27 @@ import duckdb
 from pathlib import Path
 import pandas as pd
 import json
-from datetime import datetime
+from datetime import datetime, date
+
+
+def _json_default(o):
+    """Convierte objetos no-JSON (Timestamp, numpy, NaT) a tipos serializables."""
+    try:
+        import numpy as _np
+        if isinstance(o, _np.generic):
+            return o.item()
+    except Exception:
+        pass
+    if isinstance(o, pd.Timestamp):
+        return o.isoformat()
+    if isinstance(o, (datetime, date)):
+        return o.isoformat()
+    try:
+        if pd.isna(o):
+            return None
+    except Exception:
+        pass
+    return str(o)
 
 
 def connect_db(db_path: str) -> duckdb.DuckDBPyConnection:
@@ -152,6 +172,24 @@ def get_table_columns(conn: duckdb.DuckDBPyConnection, table: str) -> list[dict]
     ]
 
 
+def ensure_columns_exist(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> None:
+    """Añade a la tabla las columnas que existan en el DataFrame pero no en la tabla.
+    Las nuevas columnas quedan con NULL para filas existentes.
+    """
+    try:
+        existing = {c["name"].lower() for c in get_table_columns(conn, table)}
+    except Exception:
+        existing = set()
+    to_add = [c for c in df.columns if str(c).lower() not in existing]
+    if not to_add:
+        return
+    qt = quote_ident(table)
+    for c in to_add:
+        col = str(c)
+        dtype = infer_duckdb_type(df[col].dtype)
+        conn.execute(f"ALTER TABLE {qt} ADD COLUMN {quote_ident(col)} {dtype};")
+
+
 def save_view(conn: duckdb.DuckDBPyConnection, table: str, name: str, spec: dict) -> None:
     new_id = next_id(conn, "saved_views")
     conn.execute(
@@ -265,7 +303,7 @@ def finalize_ingest_batch(conn: duckdb.DuckDBPyConnection, batch_id: int, table:
     details = {"batch_id": batch_id, "inserted": int(inserted), "updated": int(updated)}
     conn.execute(
         "INSERT INTO audit_events(id, event_type, table_name, action, details_json, created_at) VALUES (?, 'ingest', ?, NULL, ?, CURRENT_TIMESTAMP);",
-        [ev_id, table, json.dumps(details)],
+        [ev_id, table, json.dumps(details, default=_json_default)],
     )
     
 def finalize_ingest_batch_meta(
@@ -314,8 +352,8 @@ def log_update_versions(
     new_ids = []
     for r in rows:
         vid = next_id(conn, "update_versions")
-        keys_json = json.dumps({k: r.get(k) for k in keys})
-        old_values_json = json.dumps({c: r.get(c) for c in updated_cols})
+        keys_json = json.dumps({k: r.get(k) for k in keys}, default=_json_default)
+        old_values_json = json.dumps({c: r.get(c) for c in updated_cols}, default=_json_default)
         conn.execute(
             "INSERT INTO update_versions(id, table_name, batch_id, keys_json, old_values_json, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP);",
             [vid, table, int(batch_id), keys_json, old_values_json],
